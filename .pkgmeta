@@ -1,14 +1,11 @@
 package-as: TimbersMagAssignments
-enable-nolib-creation: no
-
-move-folders:
-  - Src/Media/*: Media/*
-  - Src/TimbersMagAssignments.lua: TimbersMagAssignments.lua
-  - Src/TimbersMagAssignments.toc: TimbersMagAssignments.toc
 
 ignore:
-    - Docs
-    - Media
-    - Screenshots
-    - .gitignore
-    - *.md
+  - Media
+  - Screenshots
+  - .gitignore
+  - Description.md
+  - README.md
+
+move-folders:
+  Src: .
