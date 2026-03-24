@@ -184,6 +184,17 @@ TMA.receivedSyncForGroup = false
 TMA.awaitingInitialSyncForGroup = false
 TMA.addonTitle = nil
 TMA.addonVersion = nil
+TMA.debugOverlay = false
+
+function TMA:IsInMagtheridonDungeon()
+    local name, instanceType = GetInstanceInfo()
+    if not name or name == "" then
+        return false
+    end
+
+    local normalizedName = string.lower(name)
+    return instanceType == "raid" and string.find(normalizedName, "magtheridon", 1, true) ~= nil
+end
 
 function TMA:IsSpecialAssigner()
     local name = UnitName("player") or ""
@@ -517,6 +528,11 @@ end
 
 function TMA:RefreshOverlay()
     if not self.overlayFrame then
+        return
+    end
+
+    if not self.debugOverlay and not self:IsInMagtheridonDungeon() then
+        self.overlayFrame:Hide()
         return
     end
 
@@ -1377,6 +1393,17 @@ function TMA:HandleSlashCommand(msg)
         return
     end
 
+    if arg == "debugoverlay" then
+        self.debugOverlay = not self.debugOverlay
+        if self.debugOverlay then
+            Print("Debug overlay enabled.")
+        else
+            Print("Debug overlay disabled.")
+        end
+        self:RefreshOverlay()
+        return
+    end
+
     Print("Unknown command. Use /tma help")
 end
 
@@ -1449,7 +1476,7 @@ function TMA:OnEvent(event, ...)
             end
             return
         end
-    elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
+    elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED_NEW_AREA" then
         self:HandleGroupStateChange()
         self:RefreshMainWindow()
         self:RefreshOverlay()
@@ -1464,3 +1491,4 @@ TMA:RegisterEvent("ADDON_LOADED")
 TMA:RegisterEvent("CHAT_MSG_ADDON")
 TMA:RegisterEvent("GROUP_ROSTER_UPDATE")
 TMA:RegisterEvent("PLAYER_ENTERING_WORLD")
+TMA:RegisterEvent("ZONE_CHANGED_NEW_AREA")
