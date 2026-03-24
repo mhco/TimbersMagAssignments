@@ -6,6 +6,3 @@ ignore:
   - .gitignore
   - Description.md
   - README.md
-
-move-folders:
-  Src: .
