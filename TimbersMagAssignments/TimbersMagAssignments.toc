@@ -1,0 +1,10 @@
+## Interface: 20505
+## Title: Timber's Mag Assignments
+## Notes: Raid click assignment manager for Magtheridon cubes
+## Author: Timberwind-DreamscytheUS
+## Version: v2026.03.24
+## Category: Timber's AddOns
+## SavedVariables: TimbersMagAssignmentsDB
+## IconTexture: Interface\AddOns\TimbersMagAssignments\Media\icon.blp
+
+TimbersMagAssignments.lua
