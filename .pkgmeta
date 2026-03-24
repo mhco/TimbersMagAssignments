@@ -1,0 +1,5 @@
+package-as: TimbersMagAssignments
+enable-nolib-creation: no
+
+ignore:
+    - Docs
