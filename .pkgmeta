@@ -8,3 +8,7 @@ ignore:
 
 move-folders:
     TimbersMagAssignments/Src: TimbersMagAssignments
+
+manual-changelog:
+    filename: CHANGELOG.md
+    markup-type: markdown
