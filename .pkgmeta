@@ -1,12 +1,10 @@
 package-as: TimbersMagAssignments
 
 ignore:
-  - Images
-  - Screenshots
-  - Description.md
-  - README.md
+    - Images
+    - Screenshots
+    - Description.md
+    - README.md
 
 move-folders:
-  Src/Media/icon.blp: Media/icon.blp
-  Src/TimbersMagAssignments.lua: TimbersMagAssignments.lua
-  Src/TimbersMagAssignments.toc: TimbersMagAssignments.toc
+    Src: .
