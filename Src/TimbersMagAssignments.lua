@@ -953,7 +953,7 @@ function TMA:CreateOverlay()
     end
 
     local f = CreateFrame("Frame", "TMAOverlayFrame", UIParent, "BackdropTemplate")
-    f:SetSize(260, 36)
+    f:SetSize(260, 50)
     f:SetPoint("CENTER", UIParent, "CENTER", self.db.overlay.x, self.db.overlay.y)
     f:SetMovable(true)
     f:EnableMouse(true)
@@ -980,9 +980,24 @@ function TMA:CreateOverlay()
     })
 
     local text = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    text:SetPoint("CENTER", f, "CENTER", 0, 0)
+    text:SetPoint("CENTER", f, "CENTER", 0, 7)
     text:SetText("")
     f.text = text
+
+    local hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    hint:SetPoint("CENTER", f, "CENTER", 0, -11)
+    hint:SetText("Hold Shift to drag")
+    f.hint = hint
+
+    local openBtn = CreateFrame("Button", nil, f)
+    openBtn:SetSize(18, 18)
+    openBtn:SetPoint("BOTTOMLEFT", f, "TOPRIGHT", -9, -9)
+    openBtn:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIcon-Maximize-Up")
+    openBtn:SetPushedTexture("Interface\\ChatFrame\\UI-ChatIcon-Maximize-Down")
+    openBtn:SetHighlightTexture("Interface\\Buttons\\UI-Common-MouseHilight", "ADD")
+    openBtn:SetScript("OnClick", function() TMA:ToggleMainWindow() end)
+    f.openButton = openBtn
+
     f:Hide()
 
     self.overlayFrame = f
