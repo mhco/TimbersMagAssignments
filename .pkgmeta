@@ -7,4 +7,4 @@ ignore:
     - README.md
 
 move-folders:
-    Src: .
+    TimbersMagAssignments/Src: TimbersMagAssignments
