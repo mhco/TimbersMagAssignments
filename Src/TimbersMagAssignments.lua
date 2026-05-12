@@ -210,6 +210,8 @@ TMA.blastNova = {
     castEndTime = nil,
     nextCastTime = nil,
     activeFallbackTime = nil,
+    lastObservedCastStartTime = nil,
+    cooldownSeconds = BLAST_NOVA_COOLDOWN_SECONDS,
 }
 TMA.pendingChannelerCombatStart = false
 TMA.monitorCombatEndedAt = nil
@@ -633,6 +635,8 @@ function TMA:ResetBlastNovaTracking()
     self.blastNova.castEndTime = nil
     self.blastNova.nextCastTime = nil
     self.blastNova.activeFallbackTime = nil
+    self.blastNova.lastObservedCastStartTime = nil
+    self.blastNova.cooldownSeconds = BLAST_NOVA_COOLDOWN_SECONDS
     self.pendingChannelerCombatStart = false
     self.monitorCombatEndedAt = nil
     self:UpdateMonitorCastBar()
@@ -684,6 +688,8 @@ function TMA:StartFirstBlastNovaTimer()
     self.blastNova.castStartTime = nil
     self.blastNova.castEndTime = nil
     self.blastNova.activeFallbackTime = nil
+    self.blastNova.lastObservedCastStartTime = nil
+    self.blastNova.cooldownSeconds = BLAST_NOVA_COOLDOWN_SECONDS
     self.blastNova.nextCastTime = now + BLAST_NOVA_COOLDOWN_SECONDS
     self:UpdateMonitorCastBar()
 end
@@ -696,6 +702,15 @@ function TMA:StartBlastNovaCast()
     self.pendingChannelerCombatStart = false
     self.monitorCombatEndedAt = nil
     local now = GetTime()
+
+    if self.blastNova.lastObservedCastStartTime then
+        local delta = now - self.blastNova.lastObservedCastStartTime
+        if delta >= 40 and delta <= 80 then
+            self.blastNova.cooldownSeconds = delta
+        end
+    end
+    self.blastNova.lastObservedCastStartTime = now
+
     self.blastNova.castStartTime = now
     self.blastNova.castEndTime = now + BLAST_NOVA_CAST_SECONDS
     self.blastNova.nextCastTime = nil
@@ -719,16 +734,17 @@ end
 
 function TMA:AdvanceBlastNovaState(now)
     now = now or GetTime()
+    local cooldown = self.blastNova.cooldownSeconds or BLAST_NOVA_COOLDOWN_SECONDS
 
     if self.blastNova.castEndTime and now >= self.blastNova.castEndTime then
         local castStartTime = self.blastNova.castStartTime or now
         self.blastNova.castStartTime = nil
         self.blastNova.castEndTime = nil
-        self.blastNova.nextCastTime = castStartTime + BLAST_NOVA_COOLDOWN_SECONDS
+        self.blastNova.nextCastTime = castStartTime + cooldown
     end
 
     if self.blastNova.activeFallbackTime and now >= self.blastNova.activeFallbackTime then
-        self.blastNova.nextCastTime = self.blastNova.activeFallbackTime + BLAST_NOVA_COOLDOWN_SECONDS
+        self.blastNova.nextCastTime = self.blastNova.activeFallbackTime + cooldown
         self.blastNova.activeFallbackTime = nil
     end
 end
@@ -842,7 +858,8 @@ function TMA:UpdateMonitorCastBar()
         if remaining < 0 then
             remaining = 0
         end
-        local progress = 1 - (remaining / BLAST_NOVA_COOLDOWN_SECONDS)
+        local cooldown = self.blastNova.cooldownSeconds or BLAST_NOVA_COOLDOWN_SECONDS
+        local progress = 1 - (remaining / cooldown)
         if progress < 0 then
             progress = 0
         elseif progress > 1 then
@@ -867,7 +884,7 @@ function TMA:UpdateMonitorCastBar()
         end
         bar:SetValue(progress)
         bar:SetStatusBarColor(0.65, 0.42, 0.9, 0.95)
-        f.castText:SetText("Mag active in " .. tostring(math.ceil(remaining)) .. "s")
+        f.castText:SetText("Channelled state ends in " .. tostring(math.ceil(remaining)) .. "s")
         return
     end
 
@@ -884,18 +901,18 @@ function TMA:UpdateMonitorHealthBars()
 
     local activeRoleCount = self.db.assignments.useFourClickers and 4 or 2
 
-    for col = 1, MONITOR_GRID_COLUMNS do
-        local assignmentRow = self.db.assignments.rows[col]
-        local iconIndex = (assignmentRow and assignmentRow.symbol) or DEFAULT_SYMBOLS[col]
-        if f.gridHeaders and f.gridHeaders[col] then
-            f.gridHeaders[col]:SetText(IconTextureString(iconIndex))
+    for symbolRow = 1, MONITOR_GRID_COLUMNS do
+        local assignmentRow = self.db.assignments.rows[symbolRow]
+        local iconIndex = (assignmentRow and assignmentRow.symbol) or DEFAULT_SYMBOLS[symbolRow]
+        if f.rowSymbols and f.rowSymbols[symbolRow] then
+            f.rowSymbols[symbolRow]:SetText(IconTextureString(iconIndex))
         end
 
-        for rowIndex = 1, 4 do
-            local cell = f.gridCells[rowIndex] and f.gridCells[rowIndex][col]
+        for roleCol = 1, 4 do
+            local cell = f.gridCells[symbolRow] and f.gridCells[symbolRow][roleCol]
             if cell then
-                if rowIndex <= activeRoleCount then
-                    local role = CLICKER_ROLES[rowIndex]
+                if roleCol <= activeRoleCount then
+                    local role = CLICKER_ROLES[roleCol]
                     local name = assignmentRow and assignmentRow[role] or nil
                     local percent = name and self:GetMonitorHealthPercent(name) or nil
 
@@ -929,19 +946,32 @@ function TMA:RefreshMonitor()
     end
 
     local activeRoleCount = self.db.assignments.useFourClickers and 4 or 2
-    local totalHeight = 88 + (activeRoleCount * (MONITOR_BAR_HEIGHT + 5))
+    local totalHeight = 88 + (MONITOR_GRID_COLUMNS * (MONITOR_BAR_HEIGHT + 5))
+    local totalWidth = 44 + (activeRoleCount * (MONITOR_BAR_WIDTH + 6))
+    f:SetWidth(totalWidth)
     f:SetHeight(totalHeight)
 
     if f.gridCells then
-        for rowIndex = 1, 4 do
-            for col = 1, MONITOR_GRID_COLUMNS do
-                local cell = f.gridCells[rowIndex] and f.gridCells[rowIndex][col]
+        for symbolRow = 1, MONITOR_GRID_COLUMNS do
+            for roleCol = 1, 4 do
+                local cell = f.gridCells[symbolRow] and f.gridCells[symbolRow][roleCol]
                 if cell then
-                    local x = 10 + ((col - 1) * (MONITOR_BAR_WIDTH + 6))
-                    local y = -62 - ((rowIndex - 1) * (MONITOR_BAR_HEIGHT + 5))
+                    local x = 32 + ((roleCol - 1) * (MONITOR_BAR_WIDTH + 6))
+                    local y = -58 - ((symbolRow - 1) * (MONITOR_BAR_HEIGHT + 5))
                     cell:ClearAllPoints()
                     cell:SetPoint("TOPLEFT", f, "TOPLEFT", x, y)
                 end
+            end
+        end
+    end
+
+    if f.rowSymbols then
+        for symbolRow = 1, MONITOR_GRID_COLUMNS do
+            local icon = f.rowSymbols[symbolRow]
+            if icon then
+                local y = -58 - ((symbolRow - 1) * (MONITOR_BAR_HEIGHT + 5)) - math.floor(MONITOR_BAR_HEIGHT / 2)
+                icon:ClearAllPoints()
+                icon:SetPoint("CENTER", f, "TOPLEFT", 16, y)
             end
         end
     end
@@ -1045,21 +1075,21 @@ function TMA:RefreshMainWindow()
 
     self.mainWindow:SetWidth(frameWidth)
 
-    if self.mainWindow.importButton and self.mainWindow.exportButton and self.mainWindow.sendButton and self.mainWindow.clearButton and self.mainWindow.monitorButton then
+    if self.mainWindow.importButton and self.mainWindow.sendButton and self.mainWindow.clearButton and self.mainWindow.monitorButton then
         self.mainWindow.monitorButton:SetText(self.db.monitor.enabled and "Hide Overlay" or "Show Overlay")
         self.mainWindow.monitorButton:Show()
 
         if canEdit then
             self.mainWindow.importButton:Show()
-            self.mainWindow.exportButton:Show()
+            if self.mainWindow.exportButton then
+                self.mainWindow.exportButton:Hide()
+            end
             self.mainWindow.sendButton:Show()
             self.mainWindow.clearButton:Show()
             self.mainWindow:SetHeight(410)
 
-            self.mainWindow.exportButton:ClearAllPoints()
-            self.mainWindow.exportButton:SetPoint("TOPRIGHT", self.mainWindow, "TOPRIGHT", -18, -36)
             self.mainWindow.importButton:ClearAllPoints()
-            self.mainWindow.importButton:SetPoint("RIGHT", self.mainWindow.exportButton, "LEFT", -8, 0)
+            self.mainWindow.importButton:SetPoint("TOPRIGHT", self.mainWindow, "TOPRIGHT", -18, -36)
 
             self.mainWindow.sendButton:ClearAllPoints()
             self.mainWindow.sendButton:SetPoint("BOTTOMLEFT", self.mainWindow, "BOTTOMLEFT", 18, 42)
@@ -1069,7 +1099,9 @@ function TMA:RefreshMainWindow()
             self.mainWindow.clearButton:SetPoint("BOTTOMRIGHT", self.mainWindow, "BOTTOMRIGHT", -18, 42)
         else
             self.mainWindow.importButton:Hide()
-            self.mainWindow.exportButton:Hide()
+            if self.mainWindow.exportButton then
+                self.mainWindow.exportButton:Hide()
+            end
             self.mainWindow.sendButton:Hide()
             self.mainWindow.clearButton:Hide()
             self.mainWindow:SetHeight(360)
@@ -1188,12 +1220,39 @@ function TMA:RefreshMainWindow()
             self:UpdateRaidPresenceDot(cell.thirdDot, thirdName, raidPresenceLookup)
             self:UpdateRaidPresenceDot(cell.fourthDot, fourthName, raidPresenceLookup)
 
+            if primaryName then
+                cell.primaryRightDot:Show()
+            else
+                cell.primaryRightDot:Hide()
+            end
+            if backupName then
+                cell.backupRightDot:Show()
+            else
+                cell.backupRightDot:Hide()
+            end
+            if thirdName then
+                cell.thirdRightDot:Show()
+            else
+                cell.thirdRightDot:Hide()
+            end
+            if fourthName then
+                cell.fourthRightDot:Show()
+            else
+                cell.fourthRightDot:Hide()
+            end
+
             if not useFourClickers then
                 if cell.thirdDot then
                     cell.thirdDot:Hide()
                 end
                 if cell.fourthDot then
                     cell.fourthDot:Hide()
+                end
+                if cell.thirdRightDot then
+                    cell.thirdRightDot:Hide()
+                end
+                if cell.fourthRightDot then
+                    cell.fourthRightDot:Hide()
                 end
             end
         end
@@ -1386,17 +1445,17 @@ function TMA:CreateImportExportWindow()
     local applyImportButton = CreateFrame("Button", nil, f, "GameMenuButtonTemplate")
     applyImportButton:SetSize(90, 22)
     applyImportButton:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -18, 14)
-    applyImportButton:SetText("Import")
+    applyImportButton:SetText("Save")
     applyImportButton:SetScript("OnClick", function()
         if not TMA:IsAssigner() then
-            Print("Only assigners can import.")
+            Print("Only assigners can save assignments.")
             return
         end
 
         local text = f.editBox:GetText() or ""
         TMA:ImportAssignmentsFromText(text)
         f:Hide()
-        Print("Import complete.")
+        Print("Assignments saved.")
     end)
 
     f.editBox = editBox
@@ -1405,29 +1464,18 @@ function TMA:CreateImportExportWindow()
     self.importExportWindow = f
 end
 
-function TMA:ShowImportExport(mode)
+function TMA:ShowImportExport()
     self:CreateImportExportWindow()
     local f = self.importExportWindow
-    f.mode = mode
-
-    if mode == "import" then
-        f:SetHeight(280)
-        f.scroll:ClearAllPoints()
-        f.scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -50)
-        f.scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -30, 46)
-        f.applyImportButton:Show()
-        f.title:SetText("Import")
-        f.editBox:SetText("")
-    else
-        f:SetHeight(250)
-        f.scroll:ClearAllPoints()
-        f.scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -50)
-        f.scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -30, 16)
-        f.applyImportButton:Hide()
-        f.title:SetText("Export")
-        f.editBox:SetText(self:ExportAssignmentsToText())
-        f.editBox:HighlightText()
-    end
+    f.mode = "importexport"
+    f:SetHeight(280)
+    f.scroll:ClearAllPoints()
+    f.scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -50)
+    f.scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -30, 46)
+    f.applyImportButton:Show()
+    f.title:SetText("Import/Export")
+    f.editBox:SetText(self:ExportAssignmentsToText())
+    f.editBox:HighlightText()
 
     f:Show()
     f:Raise()
@@ -1587,13 +1635,11 @@ function TMA:CreateMonitor()
     f.castBar = castBar
     f.castText = castText
 
-    f.gridHeaders = {}
-    for col = 1, MONITOR_GRID_COLUMNS do
+    f.rowSymbols = {}
+    for rowIndex = 1, MONITOR_GRID_COLUMNS do
         local iconText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-        local x = 10 + ((col - 1) * (MONITOR_BAR_WIDTH + 6)) + math.floor(MONITOR_BAR_WIDTH / 2)
-        iconText:SetPoint("TOP", f, "TOPLEFT", x, -44)
-        iconText:SetText(IconTextureString(DEFAULT_SYMBOLS[col]))
-        f.gridHeaders[col] = iconText
+        iconText:SetText(IconTextureString(DEFAULT_SYMBOLS[rowIndex]))
+        f.rowSymbols[rowIndex] = iconText
     end
 
     f.gridCells = {}
@@ -1663,24 +1709,25 @@ function TMA:CreateMainWindow()
     f.title:SetText((self.addonTitle or GetAddonTitle()) .. " " .. (self.addonVersion or GetAddonVersion()))
 
     local importButton = CreateFrame("Button", nil, f, "GameMenuButtonTemplate")
-    importButton:SetSize(100, 22)
-    importButton:SetPoint("TOPRIGHT", f, "TOPRIGHT", -126, -36)
-    importButton:SetText("Import")
+    importButton:SetSize(120, 22)
+    importButton:SetPoint("TOPRIGHT", f, "TOPRIGHT", -18, -36)
+    importButton:SetText("Import/Export")
     importButton:SetScript("OnClick", function()
         if not TMA:IsAssigner() then
-            Print("Only assigners can import.")
+            Print("Only assigners can edit assignments.")
             return
         end
 
-        TMA:ShowImportExport("import")
+        TMA:ShowImportExport()
     end)
 
     local exportButton = CreateFrame("Button", nil, f, "GameMenuButtonTemplate")
     exportButton:SetSize(100, 22)
-    exportButton:SetPoint("LEFT", importButton, "RIGHT", 8, 0)
+    exportButton:SetPoint("TOPRIGHT", f, "TOPRIGHT", -18, -36)
     exportButton:SetText("Export")
+    exportButton:Hide()
     exportButton:SetScript("OnClick", function()
-        TMA:ShowImportExport("export")
+        TMA:ShowImportExport()
     end)
 
     local modeCheck = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
@@ -1753,9 +1800,19 @@ function TMA:CreateMainWindow()
     local rowHeight = 44
     local function CreateRaidPresenceDot(button)
         local dot = button:CreateTexture(nil, "OVERLAY")
-        dot:SetSize(10, 10)
+        dot:SetSize(8, 8)
         dot:SetPoint("LEFT", button, "LEFT", 8, 0)
-        dot:SetTexture("Interface\\COMMON\\Indicator-Green")
+        dot:SetTexture("Interface\\CharacterFrame\\TempPortraitAlphaMask")
+        dot:SetVertexColor(0.35, 0.95, 0.45)
+        dot:Hide()
+        return dot
+    end
+    local function CreatePurpleAssignmentDot(button)
+        local dot = button:CreateTexture(nil, "OVERLAY")
+        dot:SetSize(8, 8)
+        dot:SetPoint("RIGHT", button, "RIGHT", -8, 0)
+        dot:SetTexture("Interface\\CharacterFrame\\TempPortraitAlphaMask")
+        dot:SetVertexColor(0.85, 0.35, 1.0)
         dot:Hide()
         return dot
     end
@@ -1849,6 +1906,10 @@ function TMA:CreateMainWindow()
         local backupDot = CreateRaidPresenceDot(backupButton)
         local thirdDot = CreateRaidPresenceDot(thirdButton)
         local fourthDot = CreateRaidPresenceDot(fourthButton)
+        local primaryRightDot = CreatePurpleAssignmentDot(primaryButton)
+        local backupRightDot = CreatePurpleAssignmentDot(backupButton)
+        local thirdRightDot = CreatePurpleAssignmentDot(thirdButton)
+        local fourthRightDot = CreatePurpleAssignmentDot(fourthButton)
 
         self.cells[i] = {
             rowBackdrop = rowBackdrop,
@@ -1861,6 +1922,10 @@ function TMA:CreateMainWindow()
             backupDot = backupDot,
             thirdDot = thirdDot,
             fourthDot = fourthDot,
+            primaryRightDot = primaryRightDot,
+            backupRightDot = backupRightDot,
+            thirdRightDot = thirdRightDot,
+            fourthRightDot = fourthRightDot,
             symbol = symbolText,
             primary = primaryButton:GetFontString(),
             backup = backupButton:GetFontString(),
