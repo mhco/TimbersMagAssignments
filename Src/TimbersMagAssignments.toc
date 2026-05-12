@@ -2,7 +2,7 @@
 ## Title: Timber's Mag Assignments
 ## Notes: Raid click assignment manager for Magtheridon cubes
 ## Author: Timberwind-DreamscytheUS
-## Version: v2026.05.11
+## Version: v2026.05.12
 ## SavedVariables: TimbersMagAssignmentsDB
 ## X-License: gpl-3.0-only
 ## X-Curse-Project-ID: 1494260

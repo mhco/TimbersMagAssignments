@@ -1,5 +1,18 @@
 # Changelog
 
+## v2026.05.12 (2026-05-12)
+
+- Overlay now properly shows the 5th icon in the overlay
+
+- Fixed purple circle indicators
+
+- Shadow Cage should now trigger a countdown timer
+
+- Added pause between assignment whispers to combat rate limiting
+
+- Added raid messages of assignments when clicking "Send Assignments" in case of whisper rate limits
+
+
 ## v2026.05.11 (2026-05-11)
 
 - Added overlay with castbar
