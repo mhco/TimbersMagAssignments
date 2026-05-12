@@ -9,12 +9,15 @@ local MSG_SEPARATOR = "|"
 local BLAST_NOVA_SPELL_ID = 30616
 local BLAST_NOVA_CAST_SECONDS = 2
 local BLAST_NOVA_COOLDOWN_SECONDS = 60
+local SHADOW_CAGE_SPELL_ID = 30168
+local SHADOW_CAGE_DURATION_SECONDS = 10
 local MAG_ACTIVE_FALLBACK_SECONDS = 120
 local HELLFIRE_CHANNELER_NAME = "hellfire channeler"
 local MONITOR_SYMBOL_ROWS = ROW_COUNT
 local MONITOR_CLICKER_COLUMNS = 4
 local MONITOR_BAR_WIDTH = 78
 local MONITOR_BAR_HEIGHT = 14
+local WHISPER_SYMBOL_DELAY_SECONDS = 1
 
 local RAID_ICON_NAMES = {
     [8] = "Skull",
@@ -219,6 +222,8 @@ TMA.blastNova = {
     nextCastTime = nil,
     activeFallbackTime = nil,
     lastObservedCastStartTime = nil,
+    shadowCageStartTime = nil,
+    shadowCageEndTime = nil,
     cooldownSeconds = BLAST_NOVA_COOLDOWN_SECONDS,
 }
 TMA.pendingChannelerCombatStart = false
@@ -230,6 +235,7 @@ TMA.addonTitle = nil
 TMA.addonVersion = nil
 TMA.debugOverlay = false
 TMA.addonUsers = {}
+TMA.whisperDispatchInProgress = false
 
 function TMA:IsInMagtheridonDungeon()
     local name, instanceType = GetInstanceInfo()
@@ -482,6 +488,89 @@ function TMA:GetCurrentRaidPresenceLookup()
     return lookup
 end
 
+function TMA:GetCurrentOnlineLookup()
+    local lookup = {}
+
+    if UnitInRaid("player") then
+        for i = 1, GetNumGroupMembers() do
+            local name, _, _, _, _, _, _, online, _, _, _, _, _, _, _, _, realm = GetRaidRosterInfo(i)
+            if name and name ~= "" then
+                local normalizedSimple = NormalizePlayerName(name)
+                if normalizedSimple then
+                    lookup[normalizedSimple] = online and true or false
+                end
+
+                if realm and realm ~= "" and not string.find(name, "-", 1, true) then
+                    local normalizedFull = NormalizePlayerName(name .. "-" .. realm)
+                    if normalizedFull then
+                        lookup[normalizedFull] = online and true or false
+                    end
+                end
+            end
+        end
+    elseif UnitInParty("player") then
+        local function AddPartyUnit(unit)
+            if not UnitExists(unit) then
+                return
+            end
+
+            local name, realm = UnitName(unit)
+            if not name or name == "" then
+                return
+            end
+
+            local connected = UnitIsConnected(unit) and true or false
+            local normalizedSimple = NormalizePlayerName(name)
+            if normalizedSimple then
+                lookup[normalizedSimple] = connected
+            end
+
+            if realm and realm ~= "" then
+                local normalizedFull = NormalizePlayerName(name .. "-" .. realm)
+                if normalizedFull then
+                    lookup[normalizedFull] = connected
+                end
+            end
+        end
+
+        AddPartyUnit("player")
+        for i = 1, GetNumSubgroupMembers() do
+            AddPartyUnit("party" .. i)
+        end
+    end
+
+    return lookup
+end
+
+function TMA:IsAssignedNameOffline(name, onlineLookup)
+    local normalized = NormalizePlayerName(name)
+    if not normalized then
+        return false
+    end
+
+    local status = onlineLookup and onlineLookup[normalized]
+    return status == false
+end
+
+function TMA:ApplyOfflineButtonStyle(button, assignedName, onlineLookup)
+    if not button then
+        return
+    end
+
+    local offline = self:IsAssignedNameOffline(assignedName, onlineLookup)
+    if offline then
+        button:SetAlpha(0.55)
+        if button:GetFontString() then
+            button:GetFontString():SetTextColor(0.65, 0.65, 0.65)
+        end
+    else
+        button:SetAlpha(1)
+        if button:GetFontString() then
+            button:GetFontString():SetTextColor(1, 1, 1)
+        end
+    end
+end
+
 function TMA:UpdateRaidPresenceDot(dotTexture, assignedName, raidPresenceLookup)
     if not dotTexture then
         return
@@ -701,6 +790,8 @@ function TMA:ResetBlastNovaTracking()
     self.blastNova.nextCastTime = nil
     self.blastNova.activeFallbackTime = nil
     self.blastNova.lastObservedCastStartTime = nil
+    self.blastNova.shadowCageStartTime = nil
+    self.blastNova.shadowCageEndTime = nil
     self.blastNova.cooldownSeconds = BLAST_NOVA_COOLDOWN_SECONDS
     self.pendingChannelerCombatStart = false
     self.monitorCombatEndedAt = nil
@@ -724,6 +815,38 @@ end
 function TMA:IsHellfireChannelerName(name)
     local lower = string.lower(name or "")
     return string.find(lower, HELLFIRE_CHANNELER_NAME, 1, true) ~= nil
+end
+
+function TMA:IsMagtheridonName(name)
+    local lower = string.lower(name or "")
+    return string.find(lower, "magtheridon", 1, true) ~= nil
+end
+
+function TMA:IsShadowCageSpell(spellId, spellName)
+    if spellId == SHADOW_CAGE_SPELL_ID then
+        return true
+    end
+
+    local localizedShadowCageName = GetSpellInfo(SHADOW_CAGE_SPELL_ID)
+    if localizedShadowCageName and spellName and string.lower(spellName) == string.lower(localizedShadowCageName) then
+        return true
+    end
+
+    local lowerSpellName = string.lower(spellName or "")
+    return lowerSpellName ~= "" and string.find(lowerSpellName, "shadow cage", 1, true) ~= nil
+end
+
+function TMA:StartShadowCageWindow()
+    local now = GetTime()
+    self.blastNova.shadowCageStartTime = now
+    self.blastNova.shadowCageEndTime = now + SHADOW_CAGE_DURATION_SECONDS
+    self:UpdateMonitorCastBar()
+end
+
+function TMA:EndShadowCageWindow()
+    self.blastNova.shadowCageStartTime = nil
+    self.blastNova.shadowCageEndTime = nil
+    self:UpdateMonitorCastBar()
 end
 
 function TMA:TryStartMagFallbackFromChannelerCombat(sourceName, destName)
@@ -811,6 +934,11 @@ function TMA:AdvanceBlastNovaState(now)
     if self.blastNova.activeFallbackTime and now >= self.blastNova.activeFallbackTime then
         self.blastNova.nextCastTime = self.blastNova.activeFallbackTime + cooldown
         self.blastNova.activeFallbackTime = nil
+    end
+
+    if self.blastNova.shadowCageEndTime and now >= self.blastNova.shadowCageEndTime then
+        self.blastNova.shadowCageStartTime = nil
+        self.blastNova.shadowCageEndTime = nil
     end
 end
 
@@ -903,6 +1031,27 @@ function TMA:UpdateMonitorCastBar()
     local now = GetTime()
     local bar = f.castBar
     self:AdvanceBlastNovaState(now)
+
+    if self.blastNova.shadowCageEndTime and self.blastNova.shadowCageStartTime then
+        local duration = self.blastNova.shadowCageEndTime - self.blastNova.shadowCageStartTime
+        local remaining = self.blastNova.shadowCageEndTime - now
+        if remaining < 0 then
+            remaining = 0
+        end
+        local progress = 1
+        if duration > 0 then
+            progress = 1 - (remaining / duration)
+        end
+        if progress < 0 then
+            progress = 0
+        elseif progress > 1 then
+            progress = 1
+        end
+        bar:SetValue(progress)
+        bar:SetStatusBarColor(0.72, 0.28, 0.9, 0.95)
+        f.castText:SetText("Shadow Cage ends in " .. tostring(math.ceil(remaining)) .. "s")
+        return
+    end
 
     if self.blastNova.castEndTime and self.blastNova.castStartTime then
         local duration = self.blastNova.castEndTime - self.blastNova.castStartTime
@@ -1096,14 +1245,26 @@ function TMA:RefreshOverlay()
 end
 
 function TMA:WhisperAssignments()
+    if self.whisperDispatchInProgress then
+        Print("Assignment whispers are already in progress.")
+        return
+    end
+
+    self.whisperDispatchInProgress = true
     local sent = 0
     local attempted = 0
+    local rolesToWhisper = self.db.assignments.useFourClickers and CLICKER_ROLES or {"primary", "backup"}
 
-    for i = 1, ROW_COUNT do
-        local row = self.db.assignments.rows[i]
-        local iconIndex = row.symbol or DEFAULT_SYMBOLS[i]
+    local function SendRow(rowIndex)
+        if rowIndex > ROW_COUNT then
+            TMA.whisperDispatchInProgress = false
+            Print("Sent " .. sent .. " assignment whisper(s) from " .. attempted .. " attempt(s).")
+            return
+        end
 
-        local rolesToWhisper = self.db.assignments.useFourClickers and CLICKER_ROLES or {"primary", "backup"}
+        local row = TMA.db.assignments.rows[rowIndex]
+        local iconIndex = row.symbol or DEFAULT_SYMBOLS[rowIndex]
+
         for _, role in ipairs(rolesToWhisper) do
             local target = row[role]
             if target and target ~= "" then
@@ -1112,9 +1273,17 @@ function TMA:WhisperAssignments()
                 sent = sent + 1
             end
         end
+
+        if rowIndex < ROW_COUNT and C_Timer and C_Timer.After then
+            C_Timer.After(WHISPER_SYMBOL_DELAY_SECONDS, function()
+                SendRow(rowIndex + 1)
+            end)
+        else
+            SendRow(rowIndex + 1)
+        end
     end
 
-    Print("Sent " .. sent .. " assignment whisper(s) from " .. attempted .. " attempt(s).")
+    SendRow(1)
 end
 
 function TMA:RefreshMainWindow()
@@ -1137,6 +1306,7 @@ function TMA:RefreshMainWindow()
     local rowBackdropWidth = tableWidth + 4
     local frameWidth = (left - 4) + rowBackdropWidth + 26
     local raidPresenceLookup = self:GetCurrentRaidPresenceLookup()
+    local onlineLookup = self:GetCurrentOnlineLookup()
 
     self.mainWindow:SetWidth(frameWidth)
 
@@ -1279,6 +1449,11 @@ function TMA:RefreshMainWindow()
             cell.backup:SetText(backupName or "-")
             cell.third:SetText(thirdName or "-")
             cell.fourth:SetText(fourthName or "-")
+
+            self:ApplyOfflineButtonStyle(cell.primaryButton, primaryName, onlineLookup)
+            self:ApplyOfflineButtonStyle(cell.backupButton, backupName, onlineLookup)
+            self:ApplyOfflineButtonStyle(cell.thirdButton, thirdName, onlineLookup)
+            self:ApplyOfflineButtonStyle(cell.fourthButton, fourthName, onlineLookup)
 
             self:UpdateRaidPresenceDot(cell.primaryDot, primaryName, raidPresenceLookup)
             self:UpdateRaidPresenceDot(cell.backupDot, backupName, raidPresenceLookup)
@@ -2336,11 +2511,19 @@ function TMA:OnEvent(event, ...)
             return
         end
 
-        local _, subevent, _, _, sourceName, _, _, _, destName, _, _, spellId = CombatLogGetCurrentEventInfo()
+        local _, subevent, _, _, sourceName, _, _, _, destName, _, _, spellId, spellName = CombatLogGetCurrentEventInfo()
         self:TryStartMagFallbackFromChannelerCombat(sourceName, destName)
 
         if subevent == "SPELL_CAST_START" and spellId == BLAST_NOVA_SPELL_ID then
             self:StartBlastNovaCast()
+        elseif (subevent == "SPELL_AURA_APPLIED" or subevent == "SPELL_AURA_REFRESH")
+            and self:IsMagtheridonName(destName)
+            and self:IsShadowCageSpell(spellId, spellName) then
+            self:StartShadowCageWindow()
+        elseif subevent == "SPELL_AURA_REMOVED"
+            and self:IsMagtheridonName(destName)
+            and self:IsShadowCageSpell(spellId, spellName) then
+            self:EndShadowCageWindow()
         end
     end
 end
