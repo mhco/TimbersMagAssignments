@@ -6,6 +6,14 @@ local ROW_COUNT = 5
 local MSG_REQUEST = "REQ"
 local MSG_SYNC = "SYNC"
 local MSG_SEPARATOR = "|"
+local BLAST_NOVA_SPELL_ID = 30616
+local BLAST_NOVA_CAST_SECONDS = 2
+local BLAST_NOVA_COOLDOWN_SECONDS = 60
+local MAG_ACTIVE_FALLBACK_SECONDS = 120
+local HELLFIRE_CHANNELER_NAME = "hellfire channeler"
+local MONITOR_GRID_COLUMNS = 4
+local MONITOR_BAR_WIDTH = 78
+local MONITOR_BAR_HEIGHT = 14
 
 local RAID_ICON_NAMES = {
     [8] = "Skull",
@@ -138,6 +146,7 @@ local function EnsureDB()
     db.assignments = db.assignments or BuildDefaultAssignments()
     db.minimap = db.minimap or { hide = false, angle = 210 }
     db.overlay = db.overlay or { x = 0, y = 0 }
+    db.monitor = db.monitor or { enabled = false, x = 0, y = 160, onlyInMagsLair = true }
 
     if not db.assignments.rows then
         db.assignments = BuildDefaultAssignments()
@@ -168,6 +177,19 @@ local function EnsureDB()
         db.assignments.useFourClickers = db.assignments.useFourClickers and true or false
     end
 
+    db.monitor.enabled = db.monitor.enabled and true or false
+    if type(db.monitor.x) ~= "number" then
+        db.monitor.x = 0
+    end
+    if type(db.monitor.y) ~= "number" then
+        db.monitor.y = 160
+    end
+    if db.monitor.onlyInMagsLair == nil then
+        db.monitor.onlyInMagsLair = true
+    else
+        db.monitor.onlyInMagsLair = db.monitor.onlyInMagsLair and true or false
+    end
+
     return db
 end
 
@@ -175,10 +197,22 @@ TMA.db = nil
 TMA.mainWindow = nil
 TMA.importExportWindow = nil
 TMA.overlayFrame = nil
+TMA.monitorFrame = nil
 TMA.minimapButton = nil
 TMA.cells = {}
 TMA.cellDropdownMenu = nil
 TMA.dropdownClickCatcher = nil
+TMA.monitorHealthUnits = {}
+TMA.monitorHealthDirty = true
+TMA.monitorUpdateElapsed = 0
+TMA.blastNova = {
+    castStartTime = nil,
+    castEndTime = nil,
+    nextCastTime = nil,
+    activeFallbackTime = nil,
+}
+TMA.pendingChannelerCombatStart = false
+TMA.monitorCombatEndedAt = nil
 TMA.currentGroupKey = "SOLO"
 TMA.receivedSyncForGroup = false
 TMA.awaitingInitialSyncForGroup = false
@@ -194,6 +228,18 @@ function TMA:IsInMagtheridonDungeon()
 
     local normalizedName = string.lower(name)
     return instanceType == "raid" and string.find(normalizedName, "magtheridon", 1, true) ~= nil
+end
+
+function TMA:IsMagsLairGateOpen()
+    if not self.db or not self.db.monitor or not self.db.monitor.onlyInMagsLair then
+        return true
+    end
+
+    return self:IsInMagtheridonDungeon()
+end
+
+function TMA:IsMonitorTrackingAllowed()
+    return self:IsMagsLairGateOpen()
 end
 
 function TMA:IsSpecialAssigner()
@@ -343,6 +389,50 @@ function TMA:GetRaidRosterNames()
     return names
 end
 
+function TMA:GetCurrentRaidPresenceLookup()
+    local lookup = {}
+    if not UnitInRaid("player") then
+        return lookup
+    end
+
+    for i = 1, GetNumGroupMembers() do
+        local name, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, realm = GetRaidRosterInfo(i)
+        if name and name ~= "" then
+            local simple = NormalizePlayerName(name)
+            if simple then
+                lookup[simple] = true
+            end
+
+            if realm and realm ~= "" then
+                local merged = NormalizePlayerName(name .. "-" .. realm)
+                if merged then
+                    lookup[merged] = true
+                end
+            end
+        end
+    end
+
+    return lookup
+end
+
+function TMA:UpdateRaidPresenceDot(dotTexture, assignedName, raidPresenceLookup)
+    if not dotTexture then
+        return
+    end
+
+    local normalized = NormalizePlayerName(assignedName)
+    if not normalized then
+        dotTexture:Hide()
+        return
+    end
+
+    if raidPresenceLookup and raidPresenceLookup[normalized] then
+        dotTexture:Show()
+    else
+        dotTexture:Hide()
+    end
+end
+
 function TMA:ClearNameFromAssignments(name)
     if not name or name == "" then
         return
@@ -377,6 +467,7 @@ function TMA:SetCellName(rowIndex, role, name, skipSyncBroadcast)
 
     self:RefreshMainWindow()
     self:RefreshOverlay()
+    self:RefreshMonitor()
 
     if not skipSyncBroadcast then
         self:BroadcastAssignmentsToGroup()
@@ -391,6 +482,7 @@ function TMA:SetCellSymbol(rowIndex, iconIndex, skipSyncBroadcast)
     row.symbol = iconIndex
     self:RefreshMainWindow()
     self:RefreshOverlay()
+    self:RefreshMonitor()
 
     if not skipSyncBroadcast then
         self:BroadcastAssignmentsToGroup()
@@ -402,6 +494,7 @@ function TMA:ClearAllAssignments(skipSyncBroadcast)
     self.db.assignments = BuildDefaultAssignments(keepFourClickers)
     self:RefreshMainWindow()
     self:RefreshOverlay()
+    self:RefreshMonitor()
 
     if not skipSyncBroadcast then
         self:BroadcastAssignmentsToGroup()
@@ -493,6 +586,7 @@ function TMA:ImportAssignmentsFromText(text)
 
     self:RefreshMainWindow()
     self:RefreshOverlay()
+    self:RefreshMonitor()
     self:BroadcastAssignmentsToGroup()
 end
 
@@ -526,12 +620,364 @@ function TMA:FindMyAssignment()
     return nil
 end
 
+function TMA:GetActiveClickerRoles()
+    if self.db and self.db.assignments and self.db.assignments.useFourClickers then
+        return CLICKER_ROLES
+    end
+
+    return {"primary", "backup"}
+end
+
+function TMA:ResetBlastNovaTracking()
+    self.blastNova.castStartTime = nil
+    self.blastNova.castEndTime = nil
+    self.blastNova.nextCastTime = nil
+    self.blastNova.activeFallbackTime = nil
+    self.pendingChannelerCombatStart = false
+    self.monitorCombatEndedAt = nil
+    self:UpdateMonitorCastBar()
+end
+
+function TMA:StartMagActiveFallbackTimer()
+    if not self:IsMonitorTrackingAllowed() then
+        return
+    end
+
+    local now = GetTime()
+    self.monitorCombatEndedAt = nil
+    self.blastNova.castStartTime = nil
+    self.blastNova.castEndTime = nil
+    self.blastNova.nextCastTime = nil
+    self.blastNova.activeFallbackTime = now + MAG_ACTIVE_FALLBACK_SECONDS
+    self:UpdateMonitorCastBar()
+end
+
+function TMA:IsHellfireChannelerName(name)
+    local lower = string.lower(name or "")
+    return string.find(lower, HELLFIRE_CHANNELER_NAME, 1, true) ~= nil
+end
+
+function TMA:TryStartMagFallbackFromChannelerCombat(sourceName, destName)
+    if not self.pendingChannelerCombatStart or not self:IsMonitorTrackingAllowed() then
+        return
+    end
+
+    if self.blastNova.activeFallbackTime or self.blastNova.nextCastTime or self.blastNova.castStartTime then
+        self.pendingChannelerCombatStart = false
+        return
+    end
+
+    if self:IsHellfireChannelerName(sourceName) or self:IsHellfireChannelerName(destName) then
+        self.pendingChannelerCombatStart = false
+        self:StartMagActiveFallbackTimer()
+    end
+end
+
+function TMA:StartFirstBlastNovaTimer()
+    if not self:IsMonitorTrackingAllowed() then
+        return
+    end
+
+    self.pendingChannelerCombatStart = false
+    self.monitorCombatEndedAt = nil
+    local now = GetTime()
+    self.blastNova.castStartTime = nil
+    self.blastNova.castEndTime = nil
+    self.blastNova.activeFallbackTime = nil
+    self.blastNova.nextCastTime = now + BLAST_NOVA_COOLDOWN_SECONDS
+    self:UpdateMonitorCastBar()
+end
+
+function TMA:StartBlastNovaCast()
+    if not self:IsMonitorTrackingAllowed() then
+        return
+    end
+
+    self.pendingChannelerCombatStart = false
+    self.monitorCombatEndedAt = nil
+    local now = GetTime()
+    self.blastNova.castStartTime = now
+    self.blastNova.castEndTime = now + BLAST_NOVA_CAST_SECONDS
+    self.blastNova.nextCastTime = nil
+    self.blastNova.activeFallbackTime = nil
+    self:RefreshMonitor()
+end
+
+function TMA:MaybeResetBlastNovaAfterCombatDrop(now)
+    now = now or GetTime()
+    if not self.monitorCombatEndedAt then
+        return
+    end
+
+    if now - self.monitorCombatEndedAt <= 5 then
+        return
+    end
+
+    self.monitorCombatEndedAt = nil
+    self:ResetBlastNovaTracking()
+end
+
+function TMA:AdvanceBlastNovaState(now)
+    now = now or GetTime()
+
+    if self.blastNova.castEndTime and now >= self.blastNova.castEndTime then
+        local castStartTime = self.blastNova.castStartTime or now
+        self.blastNova.castStartTime = nil
+        self.blastNova.castEndTime = nil
+        self.blastNova.nextCastTime = castStartTime + BLAST_NOVA_COOLDOWN_SECONDS
+    end
+
+    if self.blastNova.activeFallbackTime and now >= self.blastNova.activeFallbackTime then
+        self.blastNova.nextCastTime = self.blastNova.activeFallbackTime + BLAST_NOVA_COOLDOWN_SECONDS
+        self.blastNova.activeFallbackTime = nil
+    end
+end
+
+function TMA:RebuildMonitorHealthUnits()
+    for key in pairs(self.monitorHealthUnits) do
+        self.monitorHealthUnits[key] = nil
+    end
+
+    local function AddUnit(unit)
+        if not UnitExists(unit) then
+            return
+        end
+
+        local name, realm = UnitName(unit)
+        local normalized = NormalizePlayerName(name)
+        if normalized then
+            self.monitorHealthUnits[normalized] = unit
+        end
+
+        if name and realm and realm ~= "" then
+            local normalizedFull = NormalizePlayerName(name .. "-" .. realm)
+            if normalizedFull then
+                self.monitorHealthUnits[normalizedFull] = unit
+            end
+        end
+    end
+
+    AddUnit("player")
+
+    if UnitInRaid("player") then
+        for i = 1, GetNumGroupMembers() do
+            AddUnit("raid" .. i)
+        end
+    elseif UnitInParty("player") then
+        for i = 1, GetNumSubgroupMembers() do
+            AddUnit("party" .. i)
+        end
+    end
+
+    self.monitorHealthDirty = false
+end
+
+function TMA:GetMonitorHealthPercent(name)
+    if self.monitorHealthDirty then
+        self:RebuildMonitorHealthUnits()
+    end
+
+    local normalized = NormalizePlayerName(name)
+    local unit = normalized and self.monitorHealthUnits[normalized]
+    if not unit or not UnitExists(unit) or not UnitIsConnected(unit) then
+        return nil
+    end
+
+    local maxHealth = UnitHealthMax(unit) or 0
+    if maxHealth <= 0 then
+        return nil
+    end
+
+    local health = UnitHealth(unit) or 0
+    if health < 0 then
+        health = 0
+    elseif health > maxHealth then
+        health = maxHealth
+    end
+
+    return health / maxHealth
+end
+
+function TMA:SetMonitorStatusBarColor(bar, percent)
+    if not percent then
+        bar:SetStatusBarColor(0.35, 0.35, 0.35, 0.85)
+        return
+    end
+
+    if percent <= 0.25 then
+        bar:SetStatusBarColor(0.8, 0.12, 0.08, 0.95)
+    elseif percent <= 0.55 then
+        bar:SetStatusBarColor(0.9, 0.58, 0.12, 0.95)
+    else
+        bar:SetStatusBarColor(0.18, 0.72, 0.24, 0.95)
+    end
+end
+
+function TMA:UpdateMonitorCastBar()
+    local f = self.monitorFrame
+    if not f or not f.castBar then
+        return
+    end
+
+    local now = GetTime()
+    local bar = f.castBar
+    self:AdvanceBlastNovaState(now)
+
+    if self.blastNova.castEndTime and self.blastNova.castStartTime then
+        local duration = self.blastNova.castEndTime - self.blastNova.castStartTime
+        local progress = (now - self.blastNova.castStartTime) / duration
+        if progress < 0 then
+            progress = 0
+        elseif progress > 1 then
+            progress = 1
+        end
+        bar:SetValue(progress)
+        bar:SetStatusBarColor(0.9, 0.22, 0.14, 0.95)
+        f.castText:SetText("Blast Nova casting")
+        return
+    end
+
+    if self.blastNova.nextCastTime then
+        local remaining = self.blastNova.nextCastTime - now
+        if remaining < 0 then
+            remaining = 0
+        end
+        local progress = 1 - (remaining / BLAST_NOVA_COOLDOWN_SECONDS)
+        if progress < 0 then
+            progress = 0
+        elseif progress > 1 then
+            progress = 1
+        end
+        bar:SetValue(progress)
+        bar:SetStatusBarColor(0.18, 0.52, 0.9, 0.95)
+        f.castText:SetText("Blast Nova in " .. tostring(math.ceil(remaining)) .. "s")
+        return
+    end
+
+    if self.blastNova.activeFallbackTime then
+        local remaining = self.blastNova.activeFallbackTime - now
+        if remaining < 0 then
+            remaining = 0
+        end
+        local progress = 1 - (remaining / MAG_ACTIVE_FALLBACK_SECONDS)
+        if progress < 0 then
+            progress = 0
+        elseif progress > 1 then
+            progress = 1
+        end
+        bar:SetValue(progress)
+        bar:SetStatusBarColor(0.65, 0.42, 0.9, 0.95)
+        f.castText:SetText("Mag active in " .. tostring(math.ceil(remaining)) .. "s")
+        return
+    end
+
+    bar:SetValue(0)
+    bar:SetStatusBarColor(0.28, 0.28, 0.28, 0.9)
+    f.castText:SetText("Blast Nova ready")
+end
+
+function TMA:UpdateMonitorHealthBars()
+    local f = self.monitorFrame
+    if not f or not f.gridCells then
+        return
+    end
+
+    local activeRoleCount = self.db.assignments.useFourClickers and 4 or 2
+
+    for col = 1, MONITOR_GRID_COLUMNS do
+        local assignmentRow = self.db.assignments.rows[col]
+        local iconIndex = (assignmentRow and assignmentRow.symbol) or DEFAULT_SYMBOLS[col]
+        if f.gridHeaders and f.gridHeaders[col] then
+            f.gridHeaders[col]:SetText(IconTextureString(iconIndex))
+        end
+
+        for rowIndex = 1, 4 do
+            local cell = f.gridCells[rowIndex] and f.gridCells[rowIndex][col]
+            if cell then
+                if rowIndex <= activeRoleCount then
+                    local role = CLICKER_ROLES[rowIndex]
+                    local name = assignmentRow and assignmentRow[role] or nil
+                    local percent = name and self:GetMonitorHealthPercent(name) or nil
+
+                    cell.nameText:SetText(name or "-")
+                    cell.healthBar:SetValue(percent or 0)
+                    self:SetMonitorStatusBarColor(cell.healthBar, percent)
+                    if percent then
+                        cell.nameText:SetTextColor(1, 1, 1)
+                    else
+                        cell.nameText:SetTextColor(0.65, 0.65, 0.65)
+                    end
+                    cell:Show()
+                else
+                    cell:Hide()
+                end
+            end
+        end
+    end
+end
+
+function TMA:RefreshMonitor()
+    if not self.monitorFrame then
+        return
+    end
+
+    local f = self.monitorFrame
+    local canShow = self.db and self.db.monitor and self.db.monitor.enabled and self:IsMagsLairGateOpen()
+    if not canShow then
+        f:Hide()
+        return
+    end
+
+    local activeRoleCount = self.db.assignments.useFourClickers and 4 or 2
+    local totalHeight = 88 + (activeRoleCount * (MONITOR_BAR_HEIGHT + 5))
+    f:SetHeight(totalHeight)
+
+    if f.gridCells then
+        for rowIndex = 1, 4 do
+            for col = 1, MONITOR_GRID_COLUMNS do
+                local cell = f.gridCells[rowIndex] and f.gridCells[rowIndex][col]
+                if cell then
+                    local x = 10 + ((col - 1) * (MONITOR_BAR_WIDTH + 6))
+                    local y = -62 - ((rowIndex - 1) * (MONITOR_BAR_HEIGHT + 5))
+                    cell:ClearAllPoints()
+                    cell:SetPoint("TOPLEFT", f, "TOPLEFT", x, y)
+                end
+            end
+        end
+    end
+
+    self:MaybeResetBlastNovaAfterCombatDrop()
+    self:UpdateMonitorCastBar()
+    self:UpdateMonitorHealthBars()
+    f:Show()
+end
+
+function TMA:ToggleMonitor()
+    self.db.monitor.enabled = not self.db.monitor.enabled
+    self:RefreshMainWindow()
+    self:RefreshMonitor()
+end
+
+function TMA:OnMonitorUpdate(elapsed)
+    self.monitorUpdateElapsed = self.monitorUpdateElapsed + elapsed
+
+    local now = GetTime()
+    self:MaybeResetBlastNovaAfterCombatDrop(now)
+    self:AdvanceBlastNovaState(now)
+    self:UpdateMonitorCastBar()
+
+    if self.monitorUpdateElapsed >= 0.2 then
+        self.monitorUpdateElapsed = 0
+        self:UpdateMonitorHealthBars()
+    end
+end
+
 function TMA:RefreshOverlay()
     if not self.overlayFrame then
         return
     end
 
-    if not self.debugOverlay and not self:IsInMagtheridonDungeon() then
+    if not self.debugOverlay and not self:IsMagsLairGateOpen() then
         self.overlayFrame:Hide()
         return
     end
@@ -583,8 +1029,8 @@ function TMA:RefreshMainWindow()
 
     local canEdit = self:IsAssigner()
     local useFourClickers = self.db.assignments.useFourClickers and true or false
-    local tableTop = canEdit and -74 or -54
-    local rowStartY = canEdit and -96 or -76
+    local tableTop = -74
+    local rowStartY = -96
     local rowHeight = 44
 
     local left = 18
@@ -595,10 +1041,14 @@ function TMA:RefreshMainWindow()
     local tableWidth = symbolWidth + (visibleNameColumns * nameWidth) + (visibleNameColumns * gap)
     local rowBackdropWidth = tableWidth + 4
     local frameWidth = (left - 4) + rowBackdropWidth + 26
+    local raidPresenceLookup = self:GetCurrentRaidPresenceLookup()
 
     self.mainWindow:SetWidth(frameWidth)
 
-    if self.mainWindow.importButton and self.mainWindow.exportButton and self.mainWindow.sendButton and self.mainWindow.clearButton then
+    if self.mainWindow.importButton and self.mainWindow.exportButton and self.mainWindow.sendButton and self.mainWindow.clearButton and self.mainWindow.monitorButton then
+        self.mainWindow.monitorButton:SetText(self.db.monitor.enabled and "Hide Overlay" or "Show Overlay")
+        self.mainWindow.monitorButton:Show()
+
         if canEdit then
             self.mainWindow.importButton:Show()
             self.mainWindow.exportButton:Show()
@@ -613,6 +1063,8 @@ function TMA:RefreshMainWindow()
 
             self.mainWindow.sendButton:ClearAllPoints()
             self.mainWindow.sendButton:SetPoint("BOTTOMLEFT", self.mainWindow, "BOTTOMLEFT", 18, 42)
+            self.mainWindow.monitorButton:ClearAllPoints()
+            self.mainWindow.monitorButton:SetPoint("LEFT", self.mainWindow.sendButton, "RIGHT", 8, 0)
             self.mainWindow.clearButton:ClearAllPoints()
             self.mainWindow.clearButton:SetPoint("BOTTOMRIGHT", self.mainWindow, "BOTTOMRIGHT", -18, 42)
         else
@@ -620,20 +1072,35 @@ function TMA:RefreshMainWindow()
             self.mainWindow.exportButton:Hide()
             self.mainWindow.sendButton:Hide()
             self.mainWindow.clearButton:Hide()
-            self.mainWindow:SetHeight(320)
+            self.mainWindow:SetHeight(360)
+            self.mainWindow.monitorButton:ClearAllPoints()
+            self.mainWindow.monitorButton:SetPoint("BOTTOMLEFT", self.mainWindow, "BOTTOMLEFT", 18, 18)
         end
     end
 
-    if self.mainWindow.modeCheck and self.mainWindow.modeCheckLabel then
+    if self.mainWindow.modeCheck and self.mainWindow.modeCheckLabel and self.mainWindow.magOnlyCheck and self.mainWindow.magOnlyCheckLabel then
         self.mainWindow.modeCheck:SetChecked(useFourClickers)
+        self.mainWindow.magOnlyCheck:SetChecked(self.db.monitor.onlyInMagsLair)
+        self.mainWindow.magOnlyCheck:Show()
+        self.mainWindow.magOnlyCheckLabel:Show()
+        self.mainWindow.magOnlyCheck:Enable()
+        self.mainWindow.magOnlyCheckLabel:SetTextColor(1, 0.82, 0)
         if canEdit then
             self.mainWindow.modeCheck:Show()
             self.mainWindow.modeCheckLabel:Show()
             self.mainWindow.modeCheck:Enable()
             self.mainWindow.modeCheckLabel:SetTextColor(1, 0.82, 0)
+            self.mainWindow.modeCheck:ClearAllPoints()
+            self.mainWindow.modeCheck:SetPoint("TOPLEFT", self.mainWindow, "TOPLEFT", 14, -34)
+            self.mainWindow.modeCheckLabel:ClearAllPoints()
+            self.mainWindow.modeCheckLabel:SetPoint("LEFT", self.mainWindow.modeCheck, "RIGHT", 2, 1)
+            self.mainWindow.magOnlyCheck:ClearAllPoints()
+            self.mainWindow.magOnlyCheck:SetPoint("LEFT", self.mainWindow.modeCheckLabel, "RIGHT", 22, -1)
         else
             self.mainWindow.modeCheck:Hide()
             self.mainWindow.modeCheckLabel:Hide()
+            self.mainWindow.magOnlyCheck:ClearAllPoints()
+            self.mainWindow.magOnlyCheck:SetPoint("TOPLEFT", self.mainWindow, "TOPLEFT", 14, -34)
         end
     end
 
@@ -705,11 +1172,30 @@ function TMA:RefreshMainWindow()
                 end
             end
 
+            local primaryName = row.primary
+            local backupName = row.backup
+            local thirdName = row.third
+            local fourthName = row.fourth
+
             cell.symbol:SetText(IconTextureString(row.symbol or DEFAULT_SYMBOLS[i]))
-            cell.primary:SetText(row.primary or "-")
-            cell.backup:SetText(row.backup or "-")
-            cell.third:SetText(row.third or "-")
-            cell.fourth:SetText(row.fourth or "-")
+            cell.primary:SetText(primaryName or "-")
+            cell.backup:SetText(backupName or "-")
+            cell.third:SetText(thirdName or "-")
+            cell.fourth:SetText(fourthName or "-")
+
+            self:UpdateRaidPresenceDot(cell.primaryDot, primaryName, raidPresenceLookup)
+            self:UpdateRaidPresenceDot(cell.backupDot, backupName, raidPresenceLookup)
+            self:UpdateRaidPresenceDot(cell.thirdDot, thirdName, raidPresenceLookup)
+            self:UpdateRaidPresenceDot(cell.fourthDot, fourthName, raidPresenceLookup)
+
+            if not useFourClickers then
+                if cell.thirdDot then
+                    cell.thirdDot:Hide()
+                end
+                if cell.fourthDot then
+                    cell.fourthDot:Hide()
+                end
+            end
         end
     end
 end
@@ -1003,6 +1489,146 @@ function TMA:CreateOverlay()
     self.overlayFrame = f
 end
 
+function TMA:CreateMonitor()
+    if self.monitorFrame then
+        return
+    end
+
+    local f = CreateFrame("Frame", "TMAMonitorOverlay", UIParent, "BackdropTemplate")
+    f:SetSize(360, 260)
+    f:SetPoint("CENTER", UIParent, "CENTER", self.db.monitor.x, self.db.monitor.y)
+    f:SetFrameStrata("HIGH")
+    f:SetToplevel(true)
+    f:SetMovable(true)
+    f:EnableMouse(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetClampedToScreen(true)
+    f:SetScript("OnDragStart", function(selfFrame)
+        selfFrame:StartMoving()
+    end)
+    f:SetScript("OnDragStop", function(selfFrame)
+        selfFrame:StopMovingOrSizing()
+        local _, _, _, x, y = selfFrame:GetPoint()
+        TMA.db.monitor.x = math.floor((x or 0) + 0.5)
+        TMA.db.monitor.y = math.floor((y or 0) + 0.5)
+    end)
+    f:SetScript("OnUpdate", function(_, elapsed)
+        TMA:OnMonitorUpdate(elapsed)
+    end)
+
+    f:SetBackdrop({
+        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background-Dark",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true,
+        tileSize = 16,
+        edgeSize = 10,
+        insets = { left = 2, right = 2, top = 2, bottom = 2 },
+    })
+    f:SetBackdropColor(0, 0, 0, 0.82)
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    title:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -8)
+    title:SetText("Magtheridon Clickers")
+    f.title = title
+
+    local closeButton = CreateFrame("Button", nil, f)
+    closeButton:SetSize(18, 18)
+    closeButton:SetPoint("TOPRIGHT", f, "TOPRIGHT", -5, -5)
+    closeButton:SetNormalTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Up")
+    closeButton:SetPushedTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Down")
+    closeButton:SetHighlightTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Highlight", "ADD")
+    closeButton:SetScript("OnClick", function()
+        TMA.db.monitor.enabled = false
+        TMA:RefreshMainWindow()
+        TMA:RefreshMonitor()
+    end)
+    f.closeButton = closeButton
+
+    local assignmentsButton = CreateFrame("Button", nil, f)
+    assignmentsButton:SetSize(18, 18)
+    assignmentsButton:SetPoint("RIGHT", closeButton, "LEFT", -2, 0)
+    assignmentsButton:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIcon-Maximize-Up")
+    assignmentsButton:SetPushedTexture("Interface\\ChatFrame\\UI-ChatIcon-Maximize-Down")
+    assignmentsButton:SetHighlightTexture("Interface\\Buttons\\UI-Common-MouseHilight", "ADD")
+    assignmentsButton:SetScript("OnClick", function()
+        TMA:CreateMainWindow()
+        if not TMA.mainWindow:IsShown() then
+            TMA.mainWindow:Show()
+        end
+        TMA.mainWindow:Raise()
+        TMA:RefreshMainWindow()
+    end)
+    assignmentsButton:SetScript("OnEnter", function(selfButton)
+        GameTooltip:SetOwner(selfButton, "ANCHOR_LEFT")
+        GameTooltip:AddLine("Open assignments")
+        GameTooltip:Show()
+    end)
+    assignmentsButton:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+    f.assignmentsButton = assignmentsButton
+
+    local castBar = CreateFrame("StatusBar", nil, f)
+    castBar:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -24)
+    castBar:SetPoint("TOPRIGHT", f, "TOPRIGHT", -10, -24)
+    castBar:SetHeight(14)
+    castBar:SetMinMaxValues(0, 1)
+    castBar:SetValue(0)
+    castBar:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
+    castBar:SetStatusBarColor(0.28, 0.28, 0.28, 0.9)
+    castBar.bg = castBar:CreateTexture(nil, "BACKGROUND")
+    castBar.bg:SetAllPoints(castBar)
+    castBar.bg:SetTexture("Interface\\Buttons\\WHITE8X8")
+    castBar.bg:SetVertexColor(0.06, 0.06, 0.06, 0.9)
+
+    local castText = castBar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    castText:SetPoint("CENTER", castBar, "CENTER", 0, 0)
+    castText:SetText("Blast Nova ready")
+    f.castBar = castBar
+    f.castText = castText
+
+    f.gridHeaders = {}
+    for col = 1, MONITOR_GRID_COLUMNS do
+        local iconText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+        local x = 10 + ((col - 1) * (MONITOR_BAR_WIDTH + 6)) + math.floor(MONITOR_BAR_WIDTH / 2)
+        iconText:SetPoint("TOP", f, "TOPLEFT", x, -44)
+        iconText:SetText(IconTextureString(DEFAULT_SYMBOLS[col]))
+        f.gridHeaders[col] = iconText
+    end
+
+    f.gridCells = {}
+    for rowIndex = 1, 4 do
+        f.gridCells[rowIndex] = {}
+        for col = 1, MONITOR_GRID_COLUMNS do
+            local cell = CreateFrame("Frame", nil, f)
+            cell:SetSize(MONITOR_BAR_WIDTH, MONITOR_BAR_HEIGHT)
+
+            local healthBar = CreateFrame("StatusBar", nil, cell)
+            healthBar:SetAllPoints(cell)
+            healthBar:SetMinMaxValues(0, 1)
+            healthBar:SetValue(0)
+            healthBar:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
+            healthBar:SetStatusBarColor(0.35, 0.35, 0.35, 0.85)
+            healthBar.bg = healthBar:CreateTexture(nil, "BACKGROUND")
+            healthBar.bg:SetAllPoints(healthBar)
+            healthBar.bg:SetTexture("Interface\\Buttons\\WHITE8X8")
+            healthBar.bg:SetVertexColor(0.05, 0.05, 0.05, 0.9)
+
+            local nameText = healthBar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            nameText:SetPoint("CENTER", healthBar, "CENTER", 0, 0)
+            nameText:SetJustifyH("CENTER")
+            nameText:SetText("-")
+
+            cell.healthBar = healthBar
+            cell.nameText = nameText
+            f.gridCells[rowIndex][col] = cell
+        end
+    end
+
+    f:Hide()
+    self.monitorFrame = f
+end
+
 function TMA:CreateMainWindow()
     if self.mainWindow then
         return
@@ -1068,12 +1694,29 @@ function TMA:CreateMainWindow()
 
         TMA.db.assignments.useFourClickers = selfButton:GetChecked() and true or false
         TMA:RefreshMainWindow()
+        TMA:RefreshMonitor()
         TMA:BroadcastAssignmentsToGroup()
     end)
 
     local modeCheckLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     modeCheckLabel:SetPoint("LEFT", modeCheck, "RIGHT", 2, 1)
     modeCheckLabel:SetText("Use 4 clickers per icon")
+
+    local magOnlyCheck = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+    magOnlyCheck:SetSize(24, 24)
+    magOnlyCheck:SetPoint("LEFT", modeCheckLabel, "RIGHT", 22, -1)
+    magOnlyCheck:SetScript("OnClick", function(selfButton)
+        TMA.db.monitor.onlyInMagsLair = selfButton:GetChecked() and true or false
+        if TMA.db.monitor.onlyInMagsLair and not TMA:IsInMagtheridonDungeon() then
+            TMA:ResetBlastNovaTracking()
+        end
+        TMA:RefreshOverlay()
+        TMA:RefreshMonitor()
+    end)
+
+    local magOnlyCheckLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    magOnlyCheckLabel:SetPoint("LEFT", magOnlyCheck, "RIGHT", 2, 1)
+    magOnlyCheckLabel:SetText("Show overlay only in Mag's Lair")
 
     local tableTop = -74
     local left = 18
@@ -1108,6 +1751,14 @@ function TMA:CreateMainWindow()
 
     local rowStartY = -96
     local rowHeight = 44
+    local function CreateRaidPresenceDot(button)
+        local dot = button:CreateTexture(nil, "OVERLAY")
+        dot:SetSize(10, 10)
+        dot:SetPoint("LEFT", button, "LEFT", 8, 0)
+        dot:SetTexture("Interface\\COMMON\\Indicator-Green")
+        dot:Hide()
+        return dot
+    end
 
     for i = 1, ROW_COUNT do
         local y = rowStartY - ((i - 1) * rowHeight)
@@ -1194,6 +1845,11 @@ function TMA:CreateMainWindow()
         thirdButton:Hide()
         fourthButton:Hide()
 
+        local primaryDot = CreateRaidPresenceDot(primaryButton)
+        local backupDot = CreateRaidPresenceDot(backupButton)
+        local thirdDot = CreateRaidPresenceDot(thirdButton)
+        local fourthDot = CreateRaidPresenceDot(fourthButton)
+
         self.cells[i] = {
             rowBackdrop = rowBackdrop,
             symbolButton = symbolButton,
@@ -1201,6 +1857,10 @@ function TMA:CreateMainWindow()
             backupButton = backupButton,
             thirdButton = thirdButton,
             fourthButton = fourthButton,
+            primaryDot = primaryDot,
+            backupDot = backupDot,
+            thirdDot = thirdDot,
+            fourthDot = fourthDot,
             symbol = symbolText,
             primary = primaryButton:GetFontString(),
             backup = backupButton:GetFontString(),
@@ -1221,6 +1881,13 @@ function TMA:CreateMainWindow()
         TMA:WhisperAssignments()
     end)
 
+    local monitorButton = CreateFrame("Button", nil, f, "GameMenuButtonTemplate")
+    monitorButton:SetSize(132, 26)
+    monitorButton:SetPoint("LEFT", sendButton, "RIGHT", 8, 0)
+    monitorButton:SetScript("OnClick", function()
+        TMA:ToggleMonitor()
+    end)
+
     local clearButton = CreateFrame("Button", nil, f, "GameMenuButtonTemplate")
     clearButton:SetSize(170, 26)
     clearButton:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -18, 18)
@@ -1236,9 +1903,12 @@ function TMA:CreateMainWindow()
     f.importButton = importButton
     f.exportButton = exportButton
     f.sendButton = sendButton
+    f.monitorButton = monitorButton
     f.clearButton = clearButton
     f.modeCheck = modeCheck
     f.modeCheckLabel = modeCheckLabel
+    f.magOnlyCheck = magOnlyCheck
+    f.magOnlyCheckLabel = magOnlyCheckLabel
 
     self.mainWindow = f
 end
@@ -1430,6 +2100,7 @@ function TMA:ApplyRemoteAssignments(assignments, sender)
     self.db.assignments = DeepCopyAssignments(assignments)
     self:RefreshMainWindow()
     self:RefreshOverlay()
+    self:RefreshMonitor()
 end
 
 function TMA:OnEvent(event, ...)
@@ -1443,10 +2114,12 @@ function TMA:OnEvent(event, ...)
         self.addonTitle = GetAddonTitle()
         self.addonVersion = GetAddonVersion()
         self:CreateOverlay()
+        self:CreateMonitor()
         self:CreateMainWindow()
         self:CreateMinimapButton()
         self:RefreshMainWindow()
         self:RefreshOverlay()
+        self:RefreshMonitor()
 
         C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
 
@@ -1492,9 +2165,49 @@ function TMA:OnEvent(event, ...)
             return
         end
     elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED_NEW_AREA" then
+        self.monitorHealthDirty = true
+        if not self:IsMonitorTrackingAllowed() then
+            self:ResetBlastNovaTracking()
+        end
         self:HandleGroupStateChange()
         self:RefreshMainWindow()
         self:RefreshOverlay()
+        self:RefreshMonitor()
+    elseif event == "UNIT_HEALTH" or event == "UNIT_MAXHEALTH" or event == "UNIT_CONNECTION" then
+        self:UpdateMonitorHealthBars()
+    elseif event == "PLAYER_REGEN_DISABLED" then
+        self.monitorCombatEndedAt = nil
+        if self:IsMonitorTrackingAllowed() then
+            self.pendingChannelerCombatStart = true
+        else
+            self.pendingChannelerCombatStart = false
+        end
+    elseif event == "PLAYER_REGEN_ENABLED" then
+        self.pendingChannelerCombatStart = false
+        self.monitorCombatEndedAt = GetTime()
+    elseif event == "CHAT_MSG_MONSTER_YELL" then
+        local message, sender = ...
+        local lowerMessage = string.lower(message or "")
+        local lowerSender = string.lower(sender or "")
+        if self:IsMonitorTrackingAllowed()
+            and (lowerSender == "" or string.find(lowerSender, "magtheridon", 1, true))
+            and string.find(lowerMessage, "unleashed", 1, true) then
+            self:StartFirstBlastNovaTimer()
+        end
+    elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
+        if not self:IsMonitorTrackingAllowed() then
+            return
+        end
+        if type(CombatLogGetCurrentEventInfo) ~= "function" then
+            return
+        end
+
+        local _, subevent, _, _, sourceName, _, _, _, destName, _, _, spellId = CombatLogGetCurrentEventInfo()
+        self:TryStartMagFallbackFromChannelerCombat(sourceName, destName)
+
+        if subevent == "SPELL_CAST_START" and spellId == BLAST_NOVA_SPELL_ID then
+            self:StartBlastNovaCast()
+        end
     end
 end
 
@@ -1507,3 +2220,10 @@ TMA:RegisterEvent("CHAT_MSG_ADDON")
 TMA:RegisterEvent("GROUP_ROSTER_UPDATE")
 TMA:RegisterEvent("PLAYER_ENTERING_WORLD")
 TMA:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+TMA:RegisterEvent("UNIT_HEALTH")
+TMA:RegisterEvent("UNIT_MAXHEALTH")
+TMA:RegisterEvent("UNIT_CONNECTION")
+TMA:RegisterEvent("PLAYER_REGEN_DISABLED")
+TMA:RegisterEvent("PLAYER_REGEN_ENABLED")
+TMA:RegisterEvent("CHAT_MSG_MONSTER_YELL")
+TMA:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
