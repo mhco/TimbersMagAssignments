@@ -1,5 +1,12 @@
 # Changelog
 
+## v2026.05.11 (2026-05-11)
+
+- Added overlay with castbar
+- Added "is in raid" and "has addon" indicators to the assignment window
+- Unified "Import" and "Export" windows
+
+
 All notable changes to this project will be documented in this file.
 
 ## [v2026.03.31] - 2026-03-31
