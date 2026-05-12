@@ -11,7 +11,8 @@ local BLAST_NOVA_CAST_SECONDS = 2
 local BLAST_NOVA_COOLDOWN_SECONDS = 60
 local MAG_ACTIVE_FALLBACK_SECONDS = 120
 local HELLFIRE_CHANNELER_NAME = "hellfire channeler"
-local MONITOR_GRID_COLUMNS = 4
+local MONITOR_SYMBOL_ROWS = ROW_COUNT
+local MONITOR_CLICKER_COLUMNS = 4
 local MONITOR_BAR_WIDTH = 78
 local MONITOR_BAR_HEIGHT = 14
 
@@ -50,6 +51,13 @@ local function NormalizePlayerName(name)
     local normalized = Trim(name):gsub("%s+", "")
     normalized = normalized:gsub("^([a-z])", string.upper)
     return normalized
+end
+
+local function CanonicalNameKey(name)
+    if not name or name == "" then
+        return nil
+    end
+    return string.lower(Trim(name):gsub("%s+", ""))
 end
 
 local function NormalizeFullIdentity(name, realm)
@@ -221,6 +229,7 @@ TMA.awaitingInitialSyncForGroup = false
 TMA.addonTitle = nil
 TMA.addonVersion = nil
 TMA.debugOverlay = false
+TMA.addonUsers = {}
 
 function TMA:IsInMagtheridonDungeon()
     local name, instanceType = GetInstanceInfo()
@@ -242,6 +251,61 @@ end
 
 function TMA:IsMonitorTrackingAllowed()
     return self:IsMagsLairGateOpen()
+end
+
+function TMA:ResetAddonPresence()
+    self.addonUsers = {}
+    self:MarkAddonUser(UnitName("player") or "")
+end
+
+function TMA:MarkAddonUser(name)
+    local normalized = NormalizePlayerName(name)
+    if not normalized then
+        return
+    end
+
+    local key = CanonicalNameKey(normalized)
+    if key then
+        self.addonUsers[key] = true
+    end
+
+    local simple = string.match(normalized, "^([^-]+)")
+    if simple then
+        self.addonUsers[CanonicalNameKey(simple)] = true
+    end
+
+    if not string.find(normalized, "-", 1, true) then
+        local realm = Trim(GetRealmName() or ""):gsub("%s+", "")
+        if realm ~= "" then
+            self.addonUsers[CanonicalNameKey(normalized .. "-" .. realm)] = true
+        end
+    end
+end
+
+function TMA:IsAddonUser(name)
+    local normalized = NormalizePlayerName(name)
+    if not normalized then
+        return false
+    end
+
+    local direct = CanonicalNameKey(normalized)
+    if direct and self.addonUsers[direct] then
+        return true
+    end
+
+    local simple = string.match(normalized, "^([^-]+)")
+    if simple and self.addonUsers[CanonicalNameKey(simple)] then
+        return true
+    end
+
+    if not string.find(normalized, "-", 1, true) then
+        local realm = Trim(GetRealmName() or ""):gsub("%s+", "")
+        if realm ~= "" and self.addonUsers[CanonicalNameKey(normalized .. "-" .. realm)] then
+            return true
+        end
+    end
+
+    return false
 end
 
 function TMA:IsSpecialAssigner()
@@ -334,6 +398,7 @@ function TMA:HandleGroupStateChange()
     end
 
     self.currentGroupKey = newKey
+    self:ResetAddonPresence()
     self.receivedSyncForGroup = false
     self.awaitingInitialSyncForGroup = false
 
@@ -901,14 +966,14 @@ function TMA:UpdateMonitorHealthBars()
 
     local activeRoleCount = self.db.assignments.useFourClickers and 4 or 2
 
-    for symbolRow = 1, MONITOR_GRID_COLUMNS do
+    for symbolRow = 1, MONITOR_SYMBOL_ROWS do
         local assignmentRow = self.db.assignments.rows[symbolRow]
         local iconIndex = (assignmentRow and assignmentRow.symbol) or DEFAULT_SYMBOLS[symbolRow]
         if f.rowSymbols and f.rowSymbols[symbolRow] then
             f.rowSymbols[symbolRow]:SetText(IconTextureString(iconIndex))
         end
 
-        for roleCol = 1, 4 do
+        for roleCol = 1, MONITOR_CLICKER_COLUMNS do
             local cell = f.gridCells[symbolRow] and f.gridCells[symbolRow][roleCol]
             if cell then
                 if roleCol <= activeRoleCount then
@@ -946,14 +1011,14 @@ function TMA:RefreshMonitor()
     end
 
     local activeRoleCount = self.db.assignments.useFourClickers and 4 or 2
-    local totalHeight = 88 + (MONITOR_GRID_COLUMNS * (MONITOR_BAR_HEIGHT + 5))
+    local totalHeight = 88 + (MONITOR_SYMBOL_ROWS * (MONITOR_BAR_HEIGHT + 5))
     local totalWidth = 44 + (activeRoleCount * (MONITOR_BAR_WIDTH + 6))
     f:SetWidth(totalWidth)
     f:SetHeight(totalHeight)
 
     if f.gridCells then
-        for symbolRow = 1, MONITOR_GRID_COLUMNS do
-            for roleCol = 1, 4 do
+        for symbolRow = 1, MONITOR_SYMBOL_ROWS do
+            for roleCol = 1, MONITOR_CLICKER_COLUMNS do
                 local cell = f.gridCells[symbolRow] and f.gridCells[symbolRow][roleCol]
                 if cell then
                     local x = 32 + ((roleCol - 1) * (MONITOR_BAR_WIDTH + 6))
@@ -966,7 +1031,7 @@ function TMA:RefreshMonitor()
     end
 
     if f.rowSymbols then
-        for symbolRow = 1, MONITOR_GRID_COLUMNS do
+        for symbolRow = 1, MONITOR_SYMBOL_ROWS do
             local icon = f.rowSymbols[symbolRow]
             if icon then
                 local y = -58 - ((symbolRow - 1) * (MONITOR_BAR_HEIGHT + 5)) - math.floor(MONITOR_BAR_HEIGHT / 2)
@@ -1220,22 +1285,22 @@ function TMA:RefreshMainWindow()
             self:UpdateRaidPresenceDot(cell.thirdDot, thirdName, raidPresenceLookup)
             self:UpdateRaidPresenceDot(cell.fourthDot, fourthName, raidPresenceLookup)
 
-            if primaryName then
+            if primaryName and self:IsAddonUser(primaryName) then
                 cell.primaryRightDot:Show()
             else
                 cell.primaryRightDot:Hide()
             end
-            if backupName then
+            if backupName and self:IsAddonUser(backupName) then
                 cell.backupRightDot:Show()
             else
                 cell.backupRightDot:Hide()
             end
-            if thirdName then
+            if thirdName and self:IsAddonUser(thirdName) then
                 cell.thirdRightDot:Show()
             else
                 cell.thirdRightDot:Hide()
             end
-            if fourthName then
+            if fourthName and self:IsAddonUser(fourthName) then
                 cell.fourthRightDot:Show()
             else
                 cell.fourthRightDot:Hide()
@@ -1636,16 +1701,16 @@ function TMA:CreateMonitor()
     f.castText = castText
 
     f.rowSymbols = {}
-    for rowIndex = 1, MONITOR_GRID_COLUMNS do
+    for rowIndex = 1, MONITOR_SYMBOL_ROWS do
         local iconText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
         iconText:SetText(IconTextureString(DEFAULT_SYMBOLS[rowIndex]))
         f.rowSymbols[rowIndex] = iconText
     end
 
     f.gridCells = {}
-    for rowIndex = 1, 4 do
+    for rowIndex = 1, MONITOR_SYMBOL_ROWS do
         f.gridCells[rowIndex] = {}
-        for col = 1, MONITOR_GRID_COLUMNS do
+        for col = 1, MONITOR_CLICKER_COLUMNS do
             local cell = CreateFrame("Frame", nil, f)
             cell:SetSize(MONITOR_BAR_WIDTH, MONITOR_BAR_HEIGHT)
 
@@ -2176,6 +2241,7 @@ function TMA:OnEvent(event, ...)
         end
 
         self.db = EnsureDB()
+        self:ResetAddonPresence()
         self.addonTitle = GetAddonTitle()
         self.addonVersion = GetAddonVersion()
         self:CreateOverlay()
@@ -2199,6 +2265,9 @@ function TMA:OnEvent(event, ...)
         if prefix ~= PREFIX then
             return
         end
+
+        self:MarkAddonUser(sender)
+        self:RefreshMainWindow()
 
         if self:IsSenderSelf(sender) then
             return
